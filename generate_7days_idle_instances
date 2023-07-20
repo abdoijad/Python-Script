@@ -1,0 +1,177 @@
+import boto3
+import logging
+import json
+import csv
+import os
+from datetime import datetime, timedelta
+from botocore.exceptions import ClientError
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.application import MIMEApplication
+import base64
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+def lambda_handler(event, context):
+    # Initialize the CloudWatch and S3 clients
+    cloudwatch = boto3.client('cloudwatch')
+    s3 = boto3.client('s3')
+    ec2 = boto3.resource('ec2')
+    sts_client = boto3.client('sts')
+    iam_client = boto3.client('iam')
+    
+    account_id = sts_client.get_caller_identity()['Account']
+    alias_response = iam_client.list_account_aliases()
+    account_name = alias_response['AccountAliases'][0]
+    
+    logger.info(account_id)
+    logger.info(account_name)
+    
+
+    # Get the list of all running instances
+    instances = ec2.instances.filter(Filters=[{'Name': 'instance-state-name', 'Values': ['running']}])
+
+    # Create a dictionary to hold the metric data
+    metric_data = {}
+
+    # Loop through each instance and collect the metric data
+    for instance in instances:
+        instance_id = instance.id
+        response = cloudwatch.get_metric_data(
+            MetricDataQueries=[
+                {
+                    'Id': 'cpu',
+                    'MetricStat': {
+                        'Metric': {
+                            'Namespace': 'AWS/EC2',
+                            'MetricName': 'CPUUtilization',
+                            'Dimensions': [
+                                {
+                                    'Name': 'InstanceId',
+                                    'Value': instance_id
+                                },
+                            ]
+                        },
+                        'Period': 300,
+                        'Stat': 'Average',
+                        'Unit': 'Percent'
+                    },
+                    'ReturnData': True
+                },
+                {
+                    'Id': 'networkin',
+                    'MetricStat': {
+                        'Metric': {
+                            'Namespace': 'AWS/EC2',
+                            'MetricName': 'NetworkIn',
+                            'Dimensions': [
+                                {
+                                    'Name': 'InstanceId',
+                                    'Value': instance_id
+                                },
+                            ]
+                        },
+                        'Period': 300,
+                        'Stat': 'Average',
+                        'Unit': 'Bytes'
+                    },
+                    'ReturnData': True
+                },
+                {
+                    'Id': 'networkout',
+                    'MetricStat': {
+                        'Metric': {
+                            'Namespace': 'AWS/EC2',
+                            'MetricName': 'NetworkOut',
+                            'Dimensions': [
+                                {
+                                    'Name': 'InstanceId',
+                                    'Value': instance_id
+                                },
+                            ]
+                        },
+                        'Period': 300,
+                        'Stat': 'Average',
+                        'Unit': 'Bytes'
+                    },
+                    'ReturnData': True
+                }
+            ],
+            StartTime=datetime.utcnow() - timedelta(days=7),
+            EndTime=datetime.utcnow(),
+        )
+
+        # Check if the instance is idle
+        if len(response['MetricDataResults']) > 0:
+            cpu_utilization = response['MetricDataResults'][0]['Values'][0]
+            network_in = response['MetricDataResults'][1]['Values'][0]
+            network_out = response['MetricDataResults'][2]['Values'][0]
+            launch_time = instance.launch_time.replace(tzinfo=None)
+            now = datetime.utcnow()
+            time_diff = now - launch_time
+            idle_days = time_diff.days
+            idle_hours = time_diff.seconds // 3600 
+            if cpu_utilization < 2 and network_in < 5000000 and network_out < 5000000:
+                # Save the metric data for the idle instance
+                metric_data[instance_id] = {
+                    'CPUUtilization': cpu_utilization,
+                    'NetworkIn': network_in,
+                    'NetworkOut': network_out,
+                    'IdleDays': idle_days,
+                    'IdleHours': idle_days * 24
+                }
+                
+    body = f'<html><body><h2>Instances Idle on the last 7 days</h2></p>No last 7 days idle instances found</body></html>'
+    
+    try:
+        # Save the metric data as a CSV file in an S3 bucket
+        if len(metric_data) > 0:
+            bucket_name = 'impetus-co'
+            S3_OBJECT_KEY = 'idle_in_7_days_ec2_metrics.csv'
+            filename = '/tmp/idle_in_7_days_ec2_metrics.csv'
+            with open(filename, 'w', newline='') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow(['Instance ID', 'CPU Utilization (%)', 'Network In (Bytes)', 'Network Out (Bytes)', 'Idle Days', 'Idle Hours'])
+                for instance_id, data in metric_data.items():
+                    row = [instance_id, data['CPUUtilization'], data['NetworkIn'], data['NetworkOut'], data['IdleDays'], data['IdleHours']]
+                    writer.writerow(row)
+            s3.upload_file(filename, bucket_name, S3_OBJECT_KEY) 
+            s3_file_url = f"https://{bucket_name}.s3.amazonaws.com/{S3_OBJECT_KEY}"
+            
+            # Read the CSV file
+            filename = '/tmp/idle_in_7_days_ec2_metrics.csv'
+            with open(filename, 'r') as csvfile:
+                csvreader = csv.reader(csvfile)
+                table_rows = ''
+                count = 0
+                for row in csvreader:
+                    if count == 0:
+                        table_cells = ''.join(f'<th bgcolor="#3399ff">{cell}</th>' for cell in row)
+                        count += 1
+                    else:
+                        table_cells = ''.join(f'<td>{cell}</td>' for cell in row)
+                    table_rows += f'<tr>{table_cells}</tr>'
+            
+            html_table = f'<table width="80%">{table_rows}</table>'   
+                
+            # Create the email body with the HTML table
+            body = f'<html><head><style>table, th, td {{border: 1px solid black;border-collapse: collapse;}}</style></head><body><p><b>Account owner,</b></p><p>We have detected the following GP2 Vloumes in your account that appear to be able all the time or in a particular pattern. Please review these instances to determine whether they can be deactivated or placed on a schedule so they are not running all the time.</p><p><b>Account ID: </b> {account_id}</p><p><b>Account Name: </b> {account_name} </p><h2>Instances Idle in the last 7 days</h2></p>{html_table}</body></html>'
+    except Exception as e:
+        logger.error("Exception occured while trying to fetch last 7 days idle instances")
+        logger.error(e)
+    
+    # Create the response
+    response1 = {
+        "statusCode": 200,
+        "body": body
+    }
+    
+    return response1
+    
+        
+        
+        
+
+   
+
