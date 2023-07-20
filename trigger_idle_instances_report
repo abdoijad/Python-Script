@@ -1,0 +1,95 @@
+import json
+import boto3
+import logging
+from datetime import datetime, timedelta
+from botocore.exceptions import ClientError
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.application import MIMEApplication
+import base64
+ 
+# Define the client to interact with AWS Lambda
+client = boto3.client('lambda')
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+ 
+def lambda_handler(event, context):
+    # Retrieve the data to be passed to the invoked Lambda functions
+    # This assumes that the input event contains a 'data' key with the expected data
+    data = event.get('data', {})
+    
+    # Invoke the three Lambda functions asynchronously using the Boto3 client
+    
+    response1 = client.invoke(
+        FunctionName='arn:aws:lambda:us-east-1:836416707933:function:amol-test--7days',
+        #InvocationType='RequestResponse',
+        #Payload=json.dumps(data)
+        Payload=json.dumps({'key':'value'})
+        
+    )
+   
+    response2 = client.invoke(
+        FunctionName='arn:aws:lambda:us-east-1:836416707933:function:amol-weekend-data',
+        #InvocationType='RequestResponse',
+        #Payload=json.dumps(data)
+        Payload=json.dumps({'key':'value'})
+    )
+    
+    response3 = client.invoke(
+        FunctionName='arn:aws:lambda:us-east-1:836416707933:function:amol-non-working-hours',
+        #InvocationType='RequestResponse',
+        #Payload=json.dumps(data)
+        Payload=json.dumps({'key':'value'})
+    )
+    
+    data1= json.loads(response1['Payload'].read().decode())
+    data2= json.loads(response2['Payload'].read().decode())
+    data3= json.loads(response3['Payload'].read().decode())
+   
+    body={
+        "output_1":data1.get("body"),
+        "output_2":data1.get("body"),
+        "output_3":data3.get("body")
+   }
+    
+    # Send the email with the S3 file URL as attachment using Amazon SES
+    sender = 'rajaak.shaik@maxar.com'
+    recipient = 'amol.doijad@maxar.com'
+    subject = 'Idle EC2 Metrics consolidated'
+  
+	# Create a multipart/mixed parent container
+    msg = MIMEMultipart('alternative')
+    msg['Subject'] = subject 
+    msg['From'] = sender 
+    msg['To'] = recipient
+    
+    # Create a text/plain message
+    text = "Please find attached report for idle EC2 metrics."
+    
+    # Attach text message to email
+    part1 = MIMEText(text, 'plain')
+    msg.attach(part1)
+    
+    # Attach HTML table to email
+    part2 = MIMEText(data1.get("body") + data2.get("body") + data3.get("body"), 'html')
+    msg.attach(part2)
+	
+	# Send the email
+    try:
+        # Create SES client
+        ses = boto3.client('ses')
+
+        # Send email
+        response = ses.send_raw_email(
+            Source=msg['From'],
+            Destinations=[msg['To']],
+          RawMessage={
+                'Data': msg.as_string()
+            }
+            
+        )
+        logger.info("Email sent successfully.")
+    except ClientError as e:
+        logger.error("Email sending failed")
+        logger.error(e)
+
